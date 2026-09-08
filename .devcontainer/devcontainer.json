@@ -1,5 +1,5 @@
 {
     "name": "Trade_Backtest",
     "image": "mcr.microsoft.com/devcontainers/python:3.14",
-    "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && . ~/.bashrc"
+    "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && bash -lc 'source ~/.bashrc && sudo apt-get update && sudo apt-get install -y git-lfs && git lfs install'"
 }
