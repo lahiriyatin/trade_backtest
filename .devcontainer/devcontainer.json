@@ -1,0 +1,5 @@
+{
+    "name": "Trade_Backtest",
+    "image": "mcr.microsoft.com/devcontainers/python:3.14",
+    "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && . ~/.bashrc"
+}
