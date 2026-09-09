@@ -1,69 +1,207 @@
-from dotenv import load_dotenv
 import os
-from twelvedata import TDClient
+from pathlib import Path
 
-load_dotenv()
+import pandas as pd
+import requests
+from dotenv import load_dotenv
 
-
-def get_stock_data(symbol='AAPL', interval='1min', outputsize=10):
-    api_key = os.getenv('TWELVE_DATA_API_KEY') or 'demo'
-
-    td = TDClient(apikey=api_key)   #calls the Twelve Data API with the provided API key
-
-    ts = td.time_series(    #passes the symbol, interval, and output size to the time_series method of the TDClient instance
-        symbol=symbol,
-        interval=interval,
-        outputsize=outputsize
-    ) 
-
-    return ts.as_pandas() #returns the time series data as a pandas DataFrame
+from config.settings import (
+    DEFAULT_INTERVAL,
+    DEFAULT_OUTPUT_SIZE,
+    RAW_DATA_DIR,
+    REQUEST_TIMEOUT_SECONDS,
+    TWELVE_DATA_BASE_URL,
+)
 
 
-df = get_stock_data('AAPL', '1min', 10)
-
-print(df)
-
+class TwelveDataError(RuntimeError):
+    """Raised when Twelve Data returns an invalid response."""
 
 
+def get_api_key() -> str:
+    load_dotenv()
 
-# from dotenv import load_dotenv
-# import pandas as pd
-# # import twelvedata
-# from twelvedata import TDClient
-# import os
-# # import requests
+    api_key = os.getenv("TWELVE_DATA_API_KEY") or "demo"
 
-# load_dotenv()  # Load environment variables from .env file
+    if not api_key:
+        raise TwelveDataError(
+            "TWELVE_DATA_API_KEY was not found. "
+            "Add it to the project .env file."
+        )
 
-
-# def get_stock_data(symbol='AAPL', interval='1min', outputsize=10):
-#     api_key = os.getenv('TWELVE_DATA_API_KEY') or 'demo'
-#     td = TDClient(apikey=api_key)
-#     ts = td.time_series(
-#         symbol=symbol,
-#         interval=interval,
-#         outputsize=outputsize
-#     )
-#     return ts.as_pandas()
-
-#     # url = f'https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={api_key}'
-#     # response = requests.get(url)
-
-#     # if response.status_code == 200:
-#     #     data = response.json()
-#     #     if 'values' in data:
-#     #         df = pd.DataFrame(data['values'])
-#     #         df['datetime'] = pd.to_datetime(df['datetime'])
-#     #         df.set_index('datetime', inplace=True)
-#     #         return df
-#     #     else:
-#     #         print(f"Error fetching data for {symbol}: {data.get('message', 'Unknown.error')}")
-#     # else:
-#     #     print(f"HTTP error {response.status_code} for {symbol}: {response.text}")
-#     #     return pd.DataFrame()
+    return api_key
 
 
-# df = get_stock_data('AAPL', '1min', 10)
+def fetch_time_series(
+    symbol: str ="AAPL",
+    interval: str = DEFAULT_INTERVAL,
+    outputsize: int = DEFAULT_OUTPUT_SIZE,
+    end_date: pd.Timestamp | str | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    if not 1 <= outputsize <= 5000:
+        raise ValueError(
+            "outputsize must be between 1 and 5000"
+        )
 
-# print(df)
-# # print("Data fetched successfully.")
+    endpoint = f"{TWELVE_DATA_BASE_URL}/time_series"
+
+    parameters = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "timezone": "UTC",
+        "order": "ASC",
+        "format": "JSON",
+        "apikey": get_api_key(),
+    }
+
+    if end_date is not None:
+        parsed_end_date = pd.Timestamp(end_date)
+
+        if parsed_end_date.tzinfo is not None:
+            parsed_end_date = parsed_end_date.tz_convert("UTC")
+            parsed_end_date = parsed_end_date.tz_localize(None)
+
+        parameters["end_date"] = parsed_end_date.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+    try:
+        response = requests.get(
+            endpoint,
+            params=parameters,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+
+        response.raise_for_status()
+
+    except requests.Timeout as error:
+        raise TwelveDataError(
+            "Twelve Data request timed out"
+        ) from error
+
+    except requests.HTTPError as error:
+        status_code = (
+            error.response.status_code
+            if error.response is not None
+            else "unknown"
+        )
+
+        raise TwelveDataError(
+            f"Twelve Data returned HTTP {status_code}"
+        ) from error
+
+    except requests.RequestException as error:
+        raise TwelveDataError(
+            "Twelve Data request failed"
+        ) from error
+
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise TwelveDataError(
+            "API response was not valid JSON"
+        ) from error
+
+    if payload.get("status") == "error":
+        code = payload.get("code", "unknown")
+        message = payload.get(
+            "message",
+            "Unknown API error",
+        )
+
+        raise TwelveDataError(
+            f"Twelve Data error {code}: {message}"
+        )
+
+    values = payload.get("values")
+
+    if not values:
+        raise TwelveDataError(
+            f"No candle data was returned for {symbol}. "
+            "The symbol, interval, requested date, "
+            "or account plan may not provide access."
+        )
+
+    dataframe = pd.DataFrame(values)
+
+    required_columns = {
+        "datetime",
+        "open",
+        "high",
+        "low",
+        "close",
+    }
+
+    missing_columns = (
+        required_columns - set(dataframe.columns)
+    )
+
+    if missing_columns:
+        raise TwelveDataError(
+            "Response is missing columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    dataframe = dataframe.rename(
+        columns={"datetime": "timestamp"}
+    )
+
+    numeric_columns = [
+        "open",
+        "high",
+        "low",
+        "close",
+    ]
+
+    if "volume" in dataframe.columns:
+        numeric_columns.append("volume")
+
+    dataframe[numeric_columns] = dataframe[
+        numeric_columns
+    ].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+
+    dataframe["timestamp"] = pd.to_datetime(
+        dataframe["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+
+    dataframe["symbol"] = symbol.replace("/", "")
+    dataframe["interval"] = interval
+
+    dataframe = dataframe.sort_values("timestamp")
+    dataframe = dataframe.reset_index(drop=True)
+
+    metadata = payload.get("meta", {})
+
+    return dataframe, metadata
+
+
+def save_raw_data(
+    dataframe: pd.DataFrame,
+    symbol: str,
+    interval: str,
+) -> Path:
+    RAW_DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    safe_symbol = symbol.replace("/", "").lower()
+    safe_interval = interval.lower()
+
+    output_path = (
+        RAW_DATA_DIR
+        / f"{safe_symbol}_{safe_interval}.parquet"
+    )
+
+    dataframe.to_parquet(
+        output_path,
+        index=False,
+    )
+
+    return output_path
